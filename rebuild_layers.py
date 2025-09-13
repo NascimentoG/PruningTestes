@@ -186,4 +186,46 @@ def transfer_weightsBN(model, new_model, mask):
 
     return new_model
 
-def count_res_blocks
+def count_res_blocks(model):
+    # Returns the number of residual blocks per spatial dimension (last Add of each block)
+    res_blocks = {}
+
+    for layer in model.layers:
+        if isinstance(layer, Add):
+            # layer.output_shape e.g., (None, H, W, C)
+            dim = layer.output_shape[1]  # 1 and 2 are the spatial dimensions
+            res_blocks[dim] = res_blocks.get(dim, 0) + 1
+
+    return list(res_blocks.values())
+
+def rebuild_network(model, scores, p_layer):
+    num_classes = model.output_shape[-1]
+    input_shape = (model.input_shape[1:])
+
+    allowed_layers = [int(x[0]) for x in scores]
+    scores_list = [x[1] for x in scores]
+
+    filters_layers = filters_layerResNet50
+    create_model = arch.resnet50
+    transfer_weights = transfer_weightsBN
+    blocks = count_res_blocks(model)
+
+    # make copies to avoid mutating caller data
+    blocks_copy = copy.deepcopy(blocks)
+    scores_copy = copy.deepcopy(scores_list)
+    allowed_layers_copy = copy.deepcopy(allowed_layers)
+
+    blocks_new, mask = new_blocks(blocks_copy, scores_copy, allowed_layers_copy, p_layer)
+    filters = filters_layers(model, mask)
+    print(filters)
+
+    tmp_model = create_model(input_shape, blocks=copy.deepcopy(blocks_new), filters=copy.deepcopy(filters), num_classes=num_classes)
+    pruned_model = transfer_weights(model, tmp_model, mask)
+
+    # optional: force garbage collection to free old model memory
+    try:
+        gc.collect()
+    except Exception:
+        pass
+
+    return pruned_model
