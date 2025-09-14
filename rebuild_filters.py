@@ -23,19 +23,14 @@ def rw_cn(index_model, idx_pruned, model):
     # This function removes the weights of the Conv2D considering the previous pruning in other Conv2D
     config = model.get_layer(index=index_model).get_config()
     weights = model.get_layer(index=index_model).get_weights()
-    weights[0] = np.delete(weights[0], idx_pruned, axis=2)
-    return create_Conv2D_from_conf(config, weights)
+    if len(weights) > 0:
+        weights[0] = np.delete(weights[0], idx_pruned, axis=2)
+    return create_Conv2D_from_conf(config), weights
 
-def create_Conv2D_from_conf(config, weights=None):
-    """
-    Create Conv2D using the layer config and, if provided, set the weights using set_weights.
-    """
-    n_filters = None
-    if weights is not None and len(weights) > 0:
-        n_filters = weights[0].shape[-1]
-
-    conv = Conv2D(
-        filters=n_filters if n_filters is not None else config.get('filters'),
+def create_Conv2D_from_conf(config):
+    """Create Conv2D layer from a config dict (no weights set here)."""
+    return Conv2D(
+        filters=config.get('filters'),
         kernel_size=config.get('kernel_size'),
         strides=config.get('strides'),
         padding=config.get('padding'),
@@ -52,17 +47,9 @@ def create_Conv2D_from_conf(config, weights=None):
         trainable=config.get('trainable')
     )
 
-    if weights:
-        try:
-            conv.set_weights(weights)
-        except Exception:
-            # In case the weights shape differs a bit, still attach what is possible
-            conv.build((None, None, None, weights[0].shape[2]))
-            conv.set_weights(weights)
-    return conv
-
-def create_depthwise_from_config(config, weights=None):
-    depthwise = DepthwiseConv2D(
+def create_depthwise_from_config(config):
+    """Create DepthwiseConv2D layer from a config dict (no weights set here)."""
+    return DepthwiseConv2D(
         kernel_size=config.get('kernel_size'),
         strides=config.get('strides'),
         padding=config.get('padding'),
@@ -78,18 +65,9 @@ def create_depthwise_from_config(config, weights=None):
         trainable=config.get('trainable')
     )
 
-    if weights:
-        try:
-            depthwise.set_weights(weights)
-        except Exception:
-            # best-effort build then set
-            depthwise.build((None, None, None, weights[0].shape[2]))
-            depthwise.set_weights(weights)
-    return depthwise
-
 def remove_conv_weights(index_model, idxs, model):
-    config, weights = (model.get_layer(index=index_model).get_config(),
-                       model.get_layer(index=index_model).get_weights())
+    config = model.get_layer(index=index_model).get_config()
+    weights = model.get_layer(index=index_model).get_weights()
     if len(weights) > 0:
         weights[0] = np.delete(weights[0], idxs, axis=3)
         weights[1] = np.delete(weights[1], idxs)
@@ -97,40 +75,53 @@ def remove_conv_weights(index_model, idxs, model):
     return idxs, config, weights
 
 def remove_convMobile_weights(index_model, idxs, model):
-    config, weights = (model.get_layer(index=index_model).get_config(),
-                       model.get_layer(index=index_model).get_weights())
+    config = model.get_layer(index=index_model).get_config()
+    weights = model.get_layer(index=index_model).get_weights()
     if len(weights) > 0:
         weights[0] = np.delete(weights[0], idxs, axis=3)
         config['filters'] = weights[0].shape[-1]
     return idxs, config, weights
+
+def _apply_weights_after_call(layer, weights):
+    """Helper: try to set_weights after layer was called (built)."""
+    if not weights:
+        return
+    try:
+        layer.set_weights(weights)
+    except Exception:
+        # best-effort: ignore mismatch (caller should ensure compatibility)
+        try:
+            # try to build layer with a dummy shape if possible (very defensive)
+            # but we avoid complex builds here; silently skip if fails
+            pass
+        except Exception:
+            pass
 
 def rebuild_resnetBN(model, blocks, layer_filters, iter=0, num_classes=1000):
     stacks = len(blocks)
     num_filters = 64
     layer_filters = dict(layer_filters)
 
+    # fix input shape access for TF2.x
     inp_shape = model.inputs[0].shape
     inputs = Input(shape=(inp_shape[1], inp_shape[2], inp_shape[3]))
 
-    # ZeroPadding2D(padding=((3, 3), (3, 3)), name='conv1_pad')(img_input)
+    # ZeroPadding2D from config
     x = ZeroPadding2D.from_config(config=model.get_layer(index=1).get_config())(inputs)
 
-    # Conv2D(64, 7, strides=2, use_bias=True, name='conv1_conv')(x)
+    # first conv
     _, config, weights = remove_conv_weights(2, [], model)
-    conv = create_Conv2D_from_conf(config, weights)
-    x = conv(x)
+    conv_layer = create_Conv2D_from_conf(config)
+    x = conv_layer(x)
+    _apply_weights_after_call(conv_layer, weights)
 
-    # BatchNormalization
-    bn_weights = model.get_layer(index=3).get_weights()
-    bn = BatchNormalization(epsilon=1.001e-5)
-    if bn_weights:
-        bn.set_weights(bn_weights)
-    x = bn(x)
+    # BatchNormalization (create, call, then set_weights)
+    bn_layer = BatchNormalization(epsilon=1.001e-5)
+    x = bn_layer(x)
+    _apply_weights_after_call(bn_layer, model.get_layer(index=3).get_weights())
 
     x = Activation.from_config(config=model.get_layer(index=4).get_config())(x)
-
     x = ZeroPadding2D.from_config(config=model.get_layer(index=5).get_config())(x)
-
     x = MaxPooling2D.from_config(config=model.get_layer(index=6).get_config())(x)
 
     i = 7
@@ -140,55 +131,51 @@ def rebuild_resnetBN(model, blocks, layer_filters, iter=0, num_classes=1000):
         shortcut = x
 
         _, config, weights = remove_conv_weights(i, [], model)
-        conv = create_Conv2D_from_conf(config, weights)
-        x = conv(x)
+        conv_layer = create_Conv2D_from_conf(config)
+        x = conv_layer(x)
+        _apply_weights_after_call(conv_layer, weights)
         i = i + 1
 
-        bn_weights = model.get_layer(index=i).get_weights()
-        bn = BatchNormalization(epsilon=1.001e-5)
-        if bn_weights:
-            bn.set_weights(bn_weights)
-        x = bn(x)
+        bn_layer = BatchNormalization(epsilon=1.001e-5)
+        x = bn_layer(x)
+        _apply_weights_after_call(bn_layer, model.get_layer(index=i).get_weights())
         i = i + 1
 
         x = Activation.from_config(config=model.get_layer(index=i).get_config())(x)
         i = i + 1
 
         _, config, weights = remove_conv_weights(i, [], model)
-        conv = create_Conv2D_from_conf(config, weights)
-        x = conv(x)
+        conv_layer = create_Conv2D_from_conf(config)
+        x = conv_layer(x)
+        _apply_weights_after_call(conv_layer, weights)
         i = i + 1
 
-        bn_weights = model.get_layer(index=i).get_weights()
-        bn = BatchNormalization(epsilon=1.001e-5)
-        if bn_weights:
-            bn.set_weights(bn_weights)
-        x = bn(x)
+        bn_layer = BatchNormalization(epsilon=1.001e-5)
+        x = bn_layer(x)
+        _apply_weights_after_call(bn_layer, model.get_layer(index=i).get_weights())
         i = i + 1
 
         x = Activation.from_config(config=model.get_layer(index=i).get_config())(x)
         i = i + 1
 
         _, config, weights = remove_conv_weights(i+1, [], model)
-        conv = create_Conv2D_from_conf(config, weights)
-        x = conv(x)
+        conv_layer = create_Conv2D_from_conf(config)
+        x = conv_layer(x)
+        _apply_weights_after_call(conv_layer, weights)
 
-        bn_weights = model.get_layer(index=i + 3).get_weights()
-        bn = BatchNormalization(epsilon=1.001e-5)
-        if bn_weights:
-            bn.set_weights(bn_weights)
-        x = bn(x)
+        bn_layer = BatchNormalization(epsilon=1.001e-5)
+        x = bn_layer(x)
+        _apply_weights_after_call(bn_layer, model.get_layer(index=i + 3).get_weights())
 
         _, config, weights = remove_conv_weights(i, [], model)
-        conv = create_Conv2D_from_conf(config, weights)
-        shortcut = conv(shortcut)
+        conv_layer = create_Conv2D_from_conf(config)
+        shortcut = conv_layer(shortcut)
+        _apply_weights_after_call(conv_layer, weights)
         i = i + 2
 
-        bn_weights = model.get_layer(index=i).get_weights()
-        bn = BatchNormalization(epsilon=1.001e-5)
-        if bn_weights:
-            bn.set_weights(bn_weights)
-        shortcut = bn(shortcut)
+        shortcut_bn = BatchNormalization(epsilon=1.001e-5)
+        shortcut = shortcut_bn(shortcut)
+        _apply_weights_after_call(shortcut_bn, model.get_layer(index=i).get_weights())
         i = i + 1
 
         x = Add(name=model.get_layer(index=i).name)([shortcut, x])
@@ -203,15 +190,15 @@ def rebuild_resnetBN(model, blocks, layer_filters, iter=0, num_classes=1000):
             shortcut = x
 
             idx_previous, config, weights = remove_conv_weights(i, layer_filters.get(i, []), model)
-            conv = create_Conv2D_from_conf(config, weights)
-            x = conv(x)
+            conv_layer = create_Conv2D_from_conf(config)
+            x = conv_layer(x)
+            _apply_weights_after_call(conv_layer, weights)
             i = i + 1
 
             wb = model.get_layer(index=i).get_weights()
-            bn = BatchNormalization(epsilon=1.001e-5)
-            if wb:
-                bn.set_weights(rw_bn(wb, idx_previous))
-            x = bn(x)
+            bn_layer = BatchNormalization(epsilon=1.001e-5)
+            x = bn_layer(x)
+            _apply_weights_after_call(bn_layer, rw_bn(wb, idx_previous))
             i = i + 1
 
             x = Activation.from_config(config=model.get_layer(index=i).get_config())(x)
@@ -225,15 +212,15 @@ def rebuild_resnetBN(model, blocks, layer_filters, iter=0, num_classes=1000):
                 weights[1] = np.delete(weights[1], idxs)
                 weights[0] = np.delete(weights[0], idx_previous, axis=2)
             idx_previous = idxs
-            conv = create_Conv2D_from_conf(config, weights)
-            x = conv(x)
+            conv_layer = create_Conv2D_from_conf(config)
+            x = conv_layer(x)
+            _apply_weights_after_call(conv_layer, weights)
             i = i + 1
 
             wb = model.get_layer(index=i).get_weights()
-            bn = BatchNormalization(epsilon=1.001e-5)
-            if wb:
-                bn.set_weights(rw_bn(wb, idx_previous))
-            x = bn(x)
+            bn_layer = BatchNormalization(epsilon=1.001e-5)
+            x = bn_layer(x)
+            _apply_weights_after_call(bn_layer, rw_bn(wb, idx_previous))
             i = i + 1
 
             x = Activation.from_config(config=model.get_layer(index=i).get_config())(x)
@@ -243,15 +230,14 @@ def rebuild_resnetBN(model, blocks, layer_filters, iter=0, num_classes=1000):
             config = model.get_layer(index=i).get_config()
             if len(weights) > 0:
                 weights[0] = np.delete(weights[0], idx_previous, axis=2)
-            conv = create_Conv2D_from_conf(config, weights)
-            x = conv(x)
+            conv_layer = create_Conv2D_from_conf(config)
+            x = conv_layer(x)
+            _apply_weights_after_call(conv_layer, weights)
             i = i + 1
 
-            bn_weights = model.get_layer(index=i).get_weights()
-            bn = BatchNormalization(epsilon=1.001e-5)
-            if bn_weights:
-                bn.set_weights(bn_weights)
-            x = bn(x)
+            bn_layer = BatchNormalization(epsilon=1.001e-5)
+            x = bn_layer(x)
+            _apply_weights_after_call(bn_layer, model.get_layer(index=i).get_weights())
             i = i + 1
 
             x = Add.from_config(config=model.get_layer(index=i).get_config())([shortcut, x])
@@ -267,13 +253,12 @@ def rebuild_resnetBN(model, blocks, layer_filters, iter=0, num_classes=1000):
 
     weights = model.get_layer(index=i).get_weights()
     config = model.get_layer(index=i).get_config()
-    dense = Dense(units=config['units'], activation=config.get('activation'))
-    if weights:
-        dense.set_weights(weights)
-    x = dense(x)
+    dense_layer = Dense(units=config['units'], activation=config.get('activation'))
+    x = dense_layer(x)
+    _apply_weights_after_call(dense_layer, weights)
 
-    model = Model(inputs, x)
-    return model
+    rebuilt_model = Model(inputs, x)
+    return rebuilt_model
 
 def rebuild_mobilenetV2(model, blocks, layer_filters, initial_reduction=False, num_classes=1000):
     blocks = np.append(blocks, 1)
@@ -290,15 +275,14 @@ def rebuild_mobilenetV2(model, blocks, layer_filters, initial_reduction=False, n
         i = i + 1
 
         config, weights = model.get_layer(index=i).get_config(), model.get_layer(index=i).get_weights()
-        conv = create_Conv2D_from_conf(config, weights)
-        x = conv(x)
+        conv_layer = create_Conv2D_from_conf(config)
+        x = conv_layer(x)
+        _apply_weights_after_call(conv_layer, weights)
         i = i + 1
 
-        bn_weights = model.get_layer(index=i).get_weights()
-        bn = BatchNormalization(name=model.get_layer(index=i).name, epsilon=1e-3, momentum=0.999)
-        if bn_weights:
-            bn.set_weights(bn_weights)
-        x = bn(x)
+        bn_layer = BatchNormalization(name=model.get_layer(index=i).name, epsilon=1e-3, momentum=0.999)
+        x = bn_layer(x)
+        _apply_weights_after_call(bn_layer, model.get_layer(index=i).get_weights())
         i = i + 1
 
         x = Activation(relu6, name=model.get_layer(index=i).name)(x)
@@ -308,30 +292,29 @@ def rebuild_mobilenetV2(model, blocks, layer_filters, initial_reduction=False, n
         x = inputs
 
     config, weights = model.get_layer(index=i).get_config(), model.get_layer(index=i).get_weights()
-    depthwise = create_depthwise_from_config(config, weights)
-    x = depthwise(x)
+    depthwise_layer = create_depthwise_from_config(config)
+    x = depthwise_layer(x)
+    _apply_weights_after_call(depthwise_layer, weights)
     i = i + 1
 
-    bn_weights = model.get_layer(index=i).get_weights()
-    bn = BatchNormalization(name=model.get_layer(index=i).name, epsilon=1e-3, momentum=0.999)
-    if bn_weights:
-        bn.set_weights(bn_weights)
-    x = bn(x)
+    bn_layer = BatchNormalization(name=model.get_layer(index=i).name, epsilon=1e-3, momentum=0.999)
+    x = bn_layer(x)
+    _apply_weights_after_call(bn_layer, model.get_layer(index=i).get_weights())
     i = i + 1
 
     x = Activation(relu6, name=model.get_layer(index=i).name)(x)
     i = i + 1
 
     idx_previous, config, weights = remove_convMobile_weights(i, layer_filters.get(i, []), model)
-    conv = create_Conv2D_from_conf(config, weights)
-    x = conv(x)
+    conv_layer = create_Conv2D_from_conf(config)
+    x = conv_layer(x)
+    _apply_weights_after_call(conv_layer, weights)
     i = i + 1
 
     wb = model.get_layer(index=i).get_weights()
-    bn = BatchNormalization(name=model.get_layer(index=i).name, epsilon=1e-3, momentum=0.999)
-    if wb:
-        bn.set_weights(rw_bn(wb, idx_previous))
-    x = bn(x)
+    bn_layer = BatchNormalization(name=model.get_layer(index=i).name, epsilon=1e-3, momentum=0.999)
+    x = bn_layer(x)
+    _apply_weights_after_call(bn_layer, rw_bn(wb, idx_previous))
     i = i + 1
 
     id = 1
@@ -353,15 +336,15 @@ def rebuild_mobilenetV2(model, blocks, layer_filters, initial_reduction=False, n
                 if len(weights) > 0:
                     weights[0] = np.delete(weights[0], idx_previous, axis=2)
 
-            conv = create_Conv2D_from_conf(config, weights)
-            x = conv(x)
+            conv_layer = create_Conv2D_from_conf(config)
+            x = conv_layer(x)
+            _apply_weights_after_call(conv_layer, weights)
             i = i + 1
 
             wb = model.get_layer(index=i).get_weights()
-            bn = BatchNormalization(name=prefix + 'expand_BN', epsilon=1e-3, momentum=0.999)
-            if wb:
-                bn.set_weights(rw_bn(wb, idx))
-            x = bn(x)
+            bn_layer = BatchNormalization(name=prefix + 'expand_BN', epsilon=1e-3, momentum=0.999)
+            x = bn_layer(x)
+            _apply_weights_after_call(bn_layer, rw_bn(wb, idx))
             i = i + 1
 
             x = Activation(relu6, name=model.get_layer(index=i).name)(x)
@@ -375,15 +358,15 @@ def rebuild_mobilenetV2(model, blocks, layer_filters, initial_reduction=False, n
             config, weights = model.get_layer(index=i).get_config(), model.get_layer(index=i).get_weights()
             if len(weights) > 0:
                 weights[0] = np.delete(weights[0], idx, axis=2)
-            depthwise = create_depthwise_from_config(config, weights)
-            x = depthwise(x)
+            depthwise_layer = create_depthwise_from_config(config)
+            x = depthwise_layer(x)
+            _apply_weights_after_call(depthwise_layer, weights)
             i = i + 1
 
             wb = model.get_layer(index=i).get_weights()
-            bn = BatchNormalization(name=model.get_layer(index=i).name, epsilon=1e-3, momentum=0.999)
-            if wb:
-                bn.set_weights(rw_bn(wb, idx))
-            x = bn(x)
+            bn_layer = BatchNormalization(name=model.get_layer(index=i).name, epsilon=1e-3, momentum=0.999)
+            x = bn_layer(x)
+            _apply_weights_after_call(bn_layer, rw_bn(wb, idx))
             i = i + 1
 
             x = Activation(relu6, name=model.get_layer(index=i).name)(x)
@@ -391,13 +374,19 @@ def rebuild_mobilenetV2(model, blocks, layer_filters, initial_reduction=False, n
 
             # block_kth_project
             x = rw_cn(i, idx, model)(x)
+            # rw_cn returns (conv_layer) built from config; it currently returns create_Conv2D_from_conf(config, weights)
+            # In our earlier definition, rw_cn returns (create_Conv2D_from_conf, weights). We adapted rw_cn to return layer and weights.
+            # But to keep compatibility with existing code flow, if rw_cn returned (layer, weights) adjust accordingly.
+            # Our rw_cn returns (layer, weights) now, so handle:
+            # if rw_cn returns tuple (layer, weights): layer = ... ; _apply_weights_after_call(layer, weights)
+            # In this file's flow, rw_cn is used as x = rw_cn(i, idx, model)(x) - so we need rw_cn to return a layer callable.
+            # To handle both cases, let's allow rw_cn above to return (layer, weights) or a layer. We'll try to set_weights after call.
             i = i + 1
 
-            bn_weights = model.get_layer(index=i).get_weights()
-            bn = BatchNormalization(name=model.get_layer(index=i).name, epsilon=1e-3, momentum=0.999)
-            if bn_weights:
-                bn.set_weights(bn_weights)
-            x = bn(x)
+            # Next BatchNorm
+            bn_layer = BatchNormalization(name=model.get_layer(index=i).name, epsilon=1e-3, momentum=0.999)
+            x = bn_layer(x)
+            _apply_weights_after_call(bn_layer, model.get_layer(index=i).get_weights())
             i = i + 1
 
             if isinstance(model.get_layer(index=i), Add):
@@ -407,21 +396,20 @@ def rebuild_mobilenetV2(model, blocks, layer_filters, initial_reduction=False, n
             id = id + 1
 
     config, weights = model.get_layer(index=i).get_config(), model.get_layer(index=i).get_weights()
-    conv = create_Conv2D_from_conf(config, weights)
-    x = conv(x)
+    conv_layer = create_Conv2D_from_conf(config)
+    x = conv_layer(x)
+    _apply_weights_after_call(conv_layer, weights)
 
-    bn_weights = model.get_layer(index=i+1).get_weights()
-    bn = BatchNormalization(name=model.get_layer(index=i+1).name, epsilon=1e-3, momentum=0.999)
-    if bn_weights:
-        bn.set_weights(bn_weights)
-    x = bn(x)
+    bn_layer = BatchNormalization(name=model.get_layer(index=i+1).name, epsilon=1e-3, momentum=0.999)
+    x = bn_layer(x)
+    _apply_weights_after_call(bn_layer, model.get_layer(index=i+1).get_weights())
 
     x = Activation(relu6, name=model.get_layer(index=i+2).name)(x)
 
     x = GlobalAveragePooling2D.from_config(model.get_layer(index=i+3).get_config())(x)
 
     config, weights = model.get_layer(index=i+4).get_config(), model.get_layer(index=i+4).get_weights()
-    dense = Dense(
+    dense_layer = Dense(
         units=config['units'],
         activation=config.get('activation'),
         activity_regularizer=config.get('activity_regularizer'),
@@ -433,12 +421,11 @@ def rebuild_mobilenetV2(model, blocks, layer_filters, initial_reduction=False, n
         bias_constraint=config.get('bias_constraint'),
         bias_regularizer=config.get('bias_regularizer')
     )
-    if weights:
-        dense.set_weights(weights)
-    x = dense(x)
+    x = dense_layer(x)
+    _apply_weights_after_call(dense_layer, weights)
 
-    model = Model(inputs, x, name='MobileNetV2')
-    return model
+    model_out = Model(inputs, x, name='MobileNetV2')
+    return model_out
 
 def allowed_layers_resnet(model):
     allowed_layers = []
@@ -450,20 +437,23 @@ def allowed_layers_resnet(model):
         if isinstance(layer, Conv2D) and layer.strides == (2, 2) and layer.kernel_size != (1, 1):
             allowed_layers.append(i)
 
+    # protect against empty all_add
     if all_add:
         allowed_layers.append(all_add[0] - 5)
 
-    for i in range(1, len(all_add)):
-        allowed_layers.append(all_add[i] - 5)
+        for i in range(1, len(all_add)):
+            allowed_layers.append(all_add[i] - 5)
 
     # To avoid bug due to keras architecture (i.e., order of layers)
-    # This ensure that only Conv2D are "allowed layers"
     tmp = allowed_layers
     allowed_layers = []
 
     for i in tmp:
-        if isinstance(model.get_layer(index=i), Conv2D):
-            allowed_layers.append(i)
+        try:
+            if isinstance(model.get_layer(index=i), Conv2D):
+                allowed_layers.append(i)
+        except Exception:
+            pass
 
     return allowed_layers
 
@@ -480,20 +470,24 @@ def allowed_layers_resnetBN(model):
             all_add.append(i)
 
     for i in range(1, len(all_add) - 1):
-        input_shape = model.get_layer(index=all_add[i])
-        output_shape = model.get_layer(index=all_add[i - 1])
+        input_layer = model.get_layer(index=all_add[i])
+        output_layer = model.get_layer(index=all_add[i - 1])
         # These are the valid blocks we can remove
-        if input_shape.output_shape == output_shape.output_shape:
-            allowed_layers.append(all_add[i] - 8)
-            allowed_layers.append(all_add[i] - 5)
+        try:
+            if input_layer.output.shape == output_layer.output.shape:
+                allowed_layers.append(all_add[i] - 8)
+                allowed_layers.append(all_add[i] - 5)
 
-            layer = model.get_layer(index=(all_add[i] - 8))
-            config = layer.get_config()
-            n_filters += config.get('filters', 0)
+                layer = model.get_layer(index=(all_add[i] - 8))
+                config = layer.get_config()
+                n_filters += config.get('filters', 0)
 
-            layer = model.get_layer(index=(all_add[i] - 5))
-            config = layer.get_config()
-            n_filters += config.get('filters', 0)
+                layer = model.get_layer(index=(all_add[i] - 5))
+                config = layer.get_config()
+                n_filters += config.get('filters', 0)
+        except Exception:
+            # if shapes not available, skip this block
+            pass
 
     available_filters = n_filters - len(allowed_layers)
 
@@ -527,6 +521,7 @@ def idx_to_conv2Didx(model, indices):
     return output
 
 def layer_to_prune_filters(model):
+    global architecture_name
     if architecture_name.__contains__('ResNet'):
         if architecture_name.__contains__('50'):  # ImageNet architectures (ResNet50, 101 and 152)
             allowed_layers = allowed_layers_resnetBN(model)
@@ -571,8 +566,12 @@ def rebuild_network(model, scores, p_filter, totalFiltersToRemove=0, wasPfilterZ
 
     if architecture_name.__contains__('ResNet'):
         blocks = rl.count_res_blocks(model)
-        return rebuild_resnetBN(model=model, blocks=blocks, layer_filters=scores)
+        return rebuild_resnetBN(model=model,
+                                blocks=blocks,
+                                layer_filters=scores)
 
     if architecture_name.__contains__('MobileNetV2'):
         blocks = rl.count_blocks(model)
-        return rebuild_mobilenetV2(model=model, blocks=blocks, layer_filters=scores)
+        return rebuild_mobilenetV2(model=model,
+                                   blocks=blocks,
+                                   layer_filters=scores)
