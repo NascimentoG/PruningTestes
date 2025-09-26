@@ -85,7 +85,7 @@ def pruneByFilter(model, criteria, p_filter):
     
     return  rf.rebuild_network(model, scores, p_filter, numberToFilterToRemove)
 
-def prediction(self, model, X_test, y_test):
+def prediction(model, X_test, y_test):
     y_pred = np.zeros((X_test.shape[0], y_test.shape[1]))
 
     for batch in gen_batches(X_test.shape[0], 256):  # 256 stands for the number of samples in primary memory
@@ -105,6 +105,7 @@ def prediction(self, model, X_test, y_test):
           
 def statistics(model):
     acc = prediction(model, X_test, y_test)
+    
     n_params = model.count_params()
     n_filters = func.count_filters(model)
     filter_layer = func.count_filters_layer(model)
