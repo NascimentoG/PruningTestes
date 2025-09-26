@@ -84,14 +84,32 @@ def pruneByFilter(model, criteria, p_filter):
     scores = filter_method.scores(model, X_train_sampled, y_train_sampled, allowed_layers_filters)    
     
     return  rf.rebuild_network(model, scores, p_filter, numberToFilterToRemove)
-             
-def statistics(model):
-    n_params = model.count_params()
+
+def prediction(self, model, X_test, y_test):
+    y_pred = np.zeros((X_test.shape[0], y_test.shape[1]))
+
+    for batch in gen_batches(X_test.shape[0], 256):  # 256 stands for the number of samples in primary memory
+        samples = preprocess_input(X_test[batch].astype(float))
+
+        # with tf.device("CPU"):
+        X_tmp = Dataset.from_tensor_slices((samples)).batch(256)
+
+        y_pred[batch] = model.predict(X_tmp, batch_size=256, verbose=0)
+
+    top1 = top_k_accuracy_score(np.argmax(y_test, axis=1), y_pred, k=1)
+    top5 = top_k_accuracy_score(np.argmax(y_test, axis=1), y_pred, k=5)
+    top10 = top_k_accuracy_score(np.argmax(y_test, axis=1), y_pred, k=10)
+    #print('Top1 [{:.4f}] Top5 [{:.4f}] Top10 [{:.4f}]'.format(top1, top5, top10), flush=True)
     
-    acc = accuracy_score(np.argmax(y_test, axis=1), np.argmax(model.predict(X_test, verbose=0), axis=1))
+    return top1
+          
+def statistics(model):
+    acc = prediction(model, X_test, y_test)
+    n_params = model.count_params()
     n_filters = func.count_filters(model)
+    filter_layer = func.count_filters_layer(model)
     flops, _ = func.compute_flops(model)
-    blocks = rl.count_blocks(model)
+    blocks = rl.count_res_blocks(model)
 
     memory = func.memory_usage(1, model)
 
