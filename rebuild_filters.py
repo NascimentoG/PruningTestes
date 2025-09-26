@@ -494,7 +494,7 @@ def allowed_layers_resnetBN(model):
     if available_filters == 0:
         isFiltersAvailable = False
 
-    print(f"Numero de filtros nas camadas permitidas (PODA POR FILTRO) {available_filters} em {len(allowed_layers)}")
+    #print(f"Numero de filtros nas camadas permitidas (PODA POR FILTRO) {available_filters} em {len(allowed_layers)}")
     return allowed_layers
 
 def allowed_layers_mobilenetV2(model):
@@ -560,7 +560,7 @@ def rebuild_network(model, scores, p_filter, totalFiltersToRemove=0, wasPfilterZ
 
     if len(layerSelectedList) == 0:
         isFiltersAvailable = False
-        print(f"Faltam remover {totalFiltersToRemove - numberFiltersRemoved} filtros,\n Mas o numero de camadas com mais de um filtro e {len(layerSelectedList)}")
+        #print(f"Faltam remover {totalFiltersToRemove - numberFiltersRemoved} filtros,\n Mas o numero de camadas com mais de um filtro e {len(layerSelectedList)}")
 
     scores = [x for x in zip(allowed_layers, filtersToRemove)]
 

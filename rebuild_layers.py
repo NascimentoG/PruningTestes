@@ -217,7 +217,7 @@ def rebuild_network(model, scores, p_layer):
 
     blocks_new, mask = new_blocks(blocks_copy, scores_copy, allowed_layers_copy, p_layer)
     filters = filters_layers(model, mask)
-    print(filters)
+    #print(filters)
 
     tmp_model = create_model(input_shape, blocks=copy.deepcopy(blocks_new), filters=copy.deepcopy(filters), num_classes=num_classes)
     pruned_model = transfer_weights(model, tmp_model, mask)
